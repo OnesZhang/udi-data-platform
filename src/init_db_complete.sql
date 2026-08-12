@@ -1,9 +1,5 @@
--- UDI医疗器械数据平台数据库初始化脚本（完整版）
-
--- 创建数据库（如果不存在）
-CREATE DATABASE IF NOT EXISTS udi_devices CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-
-USE udi_devices;
+-- UDI医疗器械数据平台数据库初始化脚本
+-- 数据库由 db_initializer.py 创建并切换，此处仅建表
 
 -- ============================================
 -- 1. 设备主表
@@ -35,21 +31,21 @@ CREATE TABLE IF NOT EXISTS udi_devices (
     zczbhhzbapzbh VARCHAR(100) COMMENT '注册证号/备案凭证号',
     ylqxzcrbarmc VARCHAR(500) COMMENT '注册人/备案人名称',
     ylqxzcrbarywmc VARCHAR(500) COMMENT '注册人/备案人英文名称',
-    ybbm VARCHAR(100) COMMENT '医保编码',
+    ybbm VARCHAR(500) COMMENT '医保编码',
     cplb VARCHAR(50) COMMENT '产品类别',
     cgzmraqxgxx VARCHAR(500) COMMENT '采购周期风险更新信息',
     sfbjwycxsy VARCHAR(10) COMMENT '是否包含唯一标识信息',
     zdcfsycs VARCHAR(100) COMMENT '最大重复使用次数',
     sfwwjbz VARCHAR(10) COMMENT '是否为无菌包装',
     syqsfxyjxmj VARCHAR(10) COMMENT '使用前是否需要进行灭菌',
-    mjfs VARCHAR(100) COMMENT '灭菌方式',
+    mjfs VARCHAR(200) COMMENT '灭菌方式',
     qtxxdwzlj VARCHAR(100) COMMENT '其他信息位置链接',
     tsrq DATE COMMENT '提交日期',
     scbssfbhph VARCHAR(10) COMMENT '生产标识是否包含批次号',
     scbssfbhxlh VARCHAR(10) COMMENT '生产标识是否包含序列号',
     scbssfbhscrq VARCHAR(10) COMMENT '生产标识是否包含生产日期',
     scbssfbhsxrq VARCHAR(10) COMMENT '生产标识是否包含有效期',
-    tscchcztj VARCHAR(100) COMMENT '储存条件',
+    tscchcztj VARCHAR(200) COMMENT '储存条件',
     tsccsm VARCHAR(500) COMMENT '储存说明',
     version_number INT COMMENT '版本号',
     version_time DATE COMMENT '版本时间',
@@ -128,7 +124,7 @@ CREATE TABLE IF NOT EXISTS udi_contacts (
     qylxryx VARCHAR(200) COMMENT '联系人邮箱',
     qylxrdh VARCHAR(100) COMMENT '联系人电话',
     
-    UNIQUE KEY idx_device_record_key (device_record_key),
+    KEY idx_device_record_key (device_record_key),
     KEY idx_qylxryx (qylxryx),
     KEY idx_qylxrdh (qylxrdh)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='UDI联系人表';

@@ -20,9 +20,6 @@ COPY src/ .
 # 创建数据目录
 RUN mkdir -p /app/inbox
 
-# 暴露端口
-EXPOSE 8000
-
 # 复制启动脚本
 COPY startup.sh /startup.sh
 RUN chmod +x /startup.sh

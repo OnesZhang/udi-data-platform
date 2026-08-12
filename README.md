@@ -95,9 +95,8 @@ udi-data-platform/
 │   ├── config.py               # 配置管理模块
 │   ├── db_initializer.py       # 数据库初始化
 │   ├── downloader.py           # RSS下载模块
-│   ├── parser_complete.py      # XML解析器
+│   ├── parser.py               # XML解析器
 │   ├── importer.py             # 数据导入器
-│   ├── utils.py                # 工具函数
 │   ├── init_db_complete.sql    # 数据库表结构
 │   └── requirements.txt        # Python依赖
 │
@@ -224,7 +223,7 @@ docker-compose logs | grep "下载失败"
 
 ### 3. XML解析错误
 
-系统内置三级容错机制，大部分格式问题可自动修复。查看日志获取详情：
+系统在解析失败时会自动清理无效字符后重试。查看日志获取详情：
 
 ```bash
 docker-compose logs | grep "解析错误"

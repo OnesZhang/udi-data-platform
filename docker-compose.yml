@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   app:
     build:
@@ -17,6 +15,8 @@ services:
       - RSS_DAILY_URL=${RSS_DAILY_URL:-https://udi.nmpa.gov.cn/rss/download.html?files=daily}
       # 文件目录配置
       - INBOX_DIR=/app/inbox
+      # 时区（日志时间使用）
+      - TZ=${TZ:-Asia/Shanghai}
     volumes:
       - ./src:/app
       - ./inbox:/app/inbox
