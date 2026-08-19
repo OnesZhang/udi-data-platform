@@ -40,6 +40,10 @@ Thumbs.db
 inbox/*
 !inbox/.gitkeep
 
+# Completed and failed source archives are runtime data
+archive/
+failed/
+
 # External - 项目外资源（包含敏感信息，不提交）
 external/
 

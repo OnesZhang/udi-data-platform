@@ -1,289 +1,421 @@
 #!/usr/bin/env python3
-"""
-MySQL 导入模块
-
-策略：
-- 设备主表按批次 UPSERT（有则更新，无则插入）
-- 明细表（包装/储存/临床/联系人）按批次先删旧数据，再批量插入
-"""
+"""Batch import parsed UDI records into MySQL."""
 
 import logging
+import re
 import time
-from datetime import datetime
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 import mysql.connector
 
+from parser import parse_zip_file
+
 logger = logging.getLogger(__name__)
-
-BATCH_SIZE = 1000
-
-# (XML 标签, 数据库列名)
-DEVICE_FIELDS = [
-    ("deviceRecordKey", "device_record_key"),
-    ("zxxsdycpbs", "zxxsdycpbs"),
-    ("cpbsbmtxmc", "cpbsbmtxmc"),
-    ("cpbsfbrq", "cpbsfbrq"),
-    ("zxxsdyzsydydsl", "zxxsdyzsydydsl"),
-    ("sydycpbs", "sydycpbs"),
-    ("bszt", "bszt"),
-    ("sfyzcbayz", "sfyzcbayz"),
-    ("zcbacpbs", "zcbacpbs"),
-    ("sfybtzjbs", "sfybtzjbs"),
-    ("btcpbsyzxxsdycpbssfyz", "btcpbsyzxxsdycpbssfyz"),
-    ("btcpbs", "btcpbs"),
-    ("cpmctymc", "cpmctymc"),
-    ("spmc", "spmc"),
-    ("ggxh", "ggxh"),
-    ("sfwblztlcp", "sfwblztlcp"),
-    ("cpms", "cpms"),
-    ("cphhhbh", "cphhhbh"),
-    ("yflbm", "yflbm"),
-    ("qxlb", "qxlb"),
-    ("flbm", "flbm"),
-    ("tyshxydm", "tyshxydm"),
-    ("zczbhhzbapzbh", "zczbhhzbapzbh"),
-    ("ylqxzcrbarmc", "ylqxzcrbarmc"),
-    ("ylqxzcrbarywmc", "ylqxzcrbarywmc"),
-    ("ybbm", "ybbm"),
-    ("cplb", "cplb"),
-    ("cgzmraqxgxx", "cgzmraqxgxx"),
-    ("sfbjwycxsy", "sfbjwycxsy"),
-    ("zdcfsycs", "zdcfsycs"),
-    ("sfwwjbz", "sfwwjbz"),
-    ("syqsfxyjxmj", "syqsfxyjxmj"),
-    ("mjfs", "mjfs"),
-    ("qtxxdwzlj", "qtxxdwzlj"),
-    ("tsrq", "tsrq"),
-    ("scbssfbhph", "scbssfbhph"),
-    ("scbssfbhxlh", "scbssfbhxlh"),
-    ("scbssfbhscrq", "scbssfbhscrq"),
-    ("scbssfbhsxrq", "scbssfbhsxrq"),
-    ("tscchcztj", "tscchcztj"),
-    ("tsccsm", "tsccsm"),
-    ("versionNumber", "version_number"),
-    ("versionTime", "version_time"),
-    ("versionStauts", "version_status"),
-    ("correctionNumber", "correction_number"),
-    ("correctionRemark", "correction_remark"),
-    ("correctionTime", "correction_time"),
-]
-
-DATE_FIELDS = {"cpbsfbrq", "tsrq", "version_time", "correction_time"}
-INT_FIELDS = {"zxxsdyzsydydsl", "version_number", "correction_number"}
-FLAG_COLUMNS = ["has_packing_list", "has_storage_list", "has_clinical_list"]
-
-DETAIL_TABLES = ("udi_packing_list", "udi_storage_list", "udi_clinical_list", "udi_contacts")
-
-INSERT_DETAIL_SQL = {
-    "udi_packing_list": (
-        "INSERT INTO udi_packing_list (device_record_key, bzcpbs, cpbzjb, bznhxyjcpbssl, bznhxyjbzcpbs) "
-        "VALUES (%s, %s, %s, %s, %s)"
-    ),
-    "udi_storage_list": (
-        "INSERT INTO udi_storage_list (device_record_key, cchcztj, zdz, zgz, jldw) "
-        "VALUES (%s, %s, %s, %s, %s)"
-    ),
-    "udi_clinical_list": (
-        "INSERT INTO udi_clinical_list (device_record_key, lcsycclx, ccz, ccdw) "
-        "VALUES (%s, %s, %s, %s)"
-    ),
-    "udi_contacts": (
-        "INSERT INTO udi_contacts (device_record_key, qylxrcz, qylxryx, qylxrdh) "
-        "VALUES (%s, %s, %s, %s)"
-    ),
-}
-
-_device_columns = [col for _, col in DEVICE_FIELDS] + FLAG_COLUMNS
-INSERT_DEVICE_SQL = (
-    "INSERT INTO udi_devices (" + ", ".join(_device_columns) + ") VALUES ("
-    + ", ".join(["%s"] * len(_device_columns)) + ") ON DUPLICATE KEY UPDATE "
-    + ", ".join(f"{col} = VALUES({col})" for col in _device_columns if col != "device_record_key")
-)
+BATCH_SIZE = 2_000
+INTEGER_RE = re.compile(r"^\d+$")
 
 
 def _clean(value: Any) -> Optional[str]:
-    """空值统一转 None，避免空字符串触发 MySQL 严格模式报错。"""
-    if value is None:
-        return None
-    text = str(value).strip()
+    text = "" if value is None else str(value).strip()
     return text or None
 
 
-def _parse_date(value: Any) -> Optional[str]:
+def _integer(value: Any) -> Optional[int]:
     text = _clean(value)
-    if text is None:
+    return int(text) if text and INTEGER_RE.fullmatch(text) else None
+
+
+def _datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+
+    text = _clean(value)
+    if not text:
         return None
-    # correctionTime 官方数据可能带时间戳，统一只取日期部分
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+    text = text.replace("T", " ").removesuffix("Z")
+    for pattern in (
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+    ):
         try:
-            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(text, pattern)
         except ValueError:
             continue
-    logger.warning(f"无法解析日期，置空: {text}")
     return None
 
 
-def _parse_int(value: Any) -> Optional[int]:
-    text = _clean(value)
-    if text is None:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        logger.warning(f"无法解析整数，置空: {text}")
-        return None
+def _date(value: Any) -> Optional[date]:
+    parsed = _datetime(value)
+    return parsed.date() if parsed else None
 
 
-def _device_row(record: Dict[str, Any]) -> List[Any]:
-    row = []
-    for tag, column in DEVICE_FIELDS:
-        value = record.get(tag)
-        if column in DATE_FIELDS:
-            row.append(_parse_date(value))
-        elif column in INT_FIELDS:
-            row.append(_parse_int(value))
-        else:
-            row.append(_clean(value))
-    row.extend(1 if record.get(flag) else 0 for flag in FLAG_COLUMNS)
-    return row
+# XML tag, database column, converter
+DEVICE_SPECS = [
+    ("deviceRecordKey", "device_record_key", _clean),
+    ("zxxsdycpbs", "zxxsdycpbs", _clean),
+    ("cpbsbmtxmc", "cpbsbmtxmc", _clean),
+    ("cpbsfbrq", "cpbsfbrq", _date),
+    ("cpbsfbrq", "cpbsfbrq_raw", _clean),
+    ("zxxsdyzsydydsl", "zxxsdyzsydydsl", _integer),
+    ("sydycpbs", "sydycpbs", _clean),
+    ("bszt", "bszt", _clean),
+    ("sfyzcbayz", "sfyzcbayz", _clean),
+    ("zcbacpbs", "zcbacpbs", _clean),
+    ("sfybtzjbs", "sfybtzjbs", _clean),
+    ("btcpbsyzxxsdycpbssfyz", "btcpbsyzxxsdycpbssfyz", _clean),
+    ("btcpbs", "btcpbs", _clean),
+    ("cpmctymc", "cpmctymc", _clean),
+    ("spmc", "spmc", _clean),
+    ("ggxh", "ggxh", _clean),
+    ("sfwblztlcp", "sfwblztlcp", _clean),
+    ("cpms", "cpms", _clean),
+    ("cphhhbh", "cphhhbh", _clean),
+    ("yflbm", "yflbm", _clean),
+    ("qxlb", "qxlb", _clean),
+    ("flbm", "flbm", _clean),
+    ("tyshxydm", "tyshxydm", _clean),
+    ("zczbhhzbapzbh", "zczbhhzbapzbh", _clean),
+    ("ylqxzcrbarmc", "ylqxzcrbarmc", _clean),
+    ("ylqxzcrbarywmc", "ylqxzcrbarywmc", _clean),
+    ("ybbm", "ybbm", _clean),
+    ("cplb", "cplb", _clean),
+    ("cgzmraqxgxx", "cgzmraqxgxx", _clean),
+    ("sfbjwycxsy", "sfbjwycxsy", _clean),
+    ("zdcfsycs", "zdcfsycs", _integer),
+    ("sfwwjbz", "sfwwjbz", _clean),
+    ("syqsfxyjxmj", "syqsfxyjxmj", _clean),
+    ("mjfs", "mjfs", _clean),
+    ("qtxxdwzlj", "qtxxdwzlj", _clean),
+    ("tsrq", "tsrq", _date),
+    ("tsrq", "tsrq_raw", _clean),
+    ("scbssfbhph", "scbssfbhph", _clean),
+    ("scbssfbhxlh", "scbssfbhxlh", _clean),
+    ("scbssfbhscrq", "scbssfbhscrq", _clean),
+    ("scbssfbhsxrq", "scbssfbhsxrq", _clean),
+    ("tscchcztj", "tscchcztj", _clean),
+    ("tsccsm", "tsccsm", _clean),
+    ("versionNumber", "version_number", _integer),
+    ("versionTime", "version_time", _datetime),
+    ("versionTime", "version_time_raw", _clean),
+    ("versionStauts", "version_status", _clean),
+    ("correctionNumber", "correction_number", _integer),
+    ("correctionRemark", "correction_remark", _clean),
+    ("correctionTime", "correction_time", _datetime),
+    ("correctionTime", "correction_time_raw", _clean),
+]
+FLAG_COLUMNS = ("has_packing_list", "has_storage_list", "has_clinical_list")
+DEVICE_COLUMNS = [column for _, column, _ in DEVICE_SPECS] + list(FLAG_COLUMNS)
+
+INSERT_DEVICE_SQL = (
+    f"INSERT INTO udi_devices ({', '.join(DEVICE_COLUMNS)}) VALUES "
+    f"({', '.join(['%s'] * len(DEVICE_COLUMNS))}) ON DUPLICATE KEY UPDATE "
+    + ", ".join(
+        f"{column}=VALUES({column})"
+        for column in DEVICE_COLUMNS
+        if column != "device_record_key"
+    )
+)
+INSERT_DETAIL_SQL = {
+    "udi_packing_list": (
+        "INSERT INTO udi_packing_list "
+        "(device_record_key,item_no,bzcpbs,cpbzjb,bznhxyjcpbssl,bznhxyjbzcpbs) "
+        "VALUES (%s,%s,%s,%s,%s,%s)"
+    ),
+    "udi_storage_list": (
+        "INSERT INTO udi_storage_list "
+        "(device_record_key,item_no,cchcztj,zdz,zgz,jldw) "
+        "VALUES (%s,%s,%s,%s,%s,%s)"
+    ),
+    "udi_clinical_list": (
+        "INSERT INTO udi_clinical_list "
+        "(device_record_key,item_no,lcsycclx,ccz,ccdw) "
+        "VALUES (%s,%s,%s,%s,%s)"
+    ),
+    "udi_contacts": (
+        "INSERT INTO udi_contacts "
+        "(device_record_key,item_no,qylxrcz,qylxryx,qylxrdh) "
+        "VALUES (%s,%s,%s,%s,%s)"
+    ),
+}
+DETAIL_TABLES = tuple(INSERT_DETAIL_SQL)
 
 
-def _detail_rows(record: Dict[str, Any]) -> Dict[str, List[Tuple[Any, ...]]]:
-    key = record.get("deviceRecordKey")
-    return {
-        "udi_packing_list": [
-            (key, _clean(p.get("bzcpbs")), _clean(p.get("cpbzjb")),
-             _parse_int(p.get("bznhxyjcpbssl")), _clean(p.get("bznhxyjbzcpbs")))
-            for p in record.get("packing_list", [])
-        ],
-        "udi_storage_list": [
-            (key, _clean(s.get("cchcztj")), _clean(s.get("zdz")), _clean(s.get("zgz")), _clean(s.get("jldw")))
-            for s in record.get("storage_list", [])
-        ],
-        "udi_clinical_list": [
-            (key, _clean(c.get("lcsycclx")), _clean(c.get("ccz")), _clean(c.get("ccdw")))
-            for c in record.get("clinical_list", [])
-        ],
-        "udi_contacts": [
-            (key, _clean(c.get("qylxrcz")), _clean(c.get("qylxryx")), _clean(c.get("qylxrdh")))
-            for c in record.get("contact_list", [])
-        ],
-    }
+def _connect(config):
+    return mysql.connector.connect(
+        host=config.db_host,
+        port=config.db_port,
+        database=config.db_name,
+        user=config.db_user,
+        password=config.db_password,
+        autocommit=False,
+        connection_timeout=30,
+        read_timeout=600,
+        write_timeout=600,
+    )
 
 
-def _import_batch(conn, records: List[Dict[str, Any]]) -> None:
-    """导入一批记录：UPSERT 设备 + 删除旧明细 + 插入新明细。"""
-    device_rows = [_device_row(r) for r in records]
-    keys = [row[0] for row in device_rows]
-    placeholders = ", ".join(["%s"] * len(keys))
+def _version_key(record: Dict[str, Any]) -> tuple:
+    version = _integer(record.get("versionNumber"))
+    correction = _integer(record.get("correctionNumber"))
+    return (
+        version if version is not None else -1,
+        correction if correction is not None else -1,
+        _datetime(record.get("versionTime")) or datetime.min,
+        _datetime(record.get("correctionTime")) or datetime.min,
+    )
 
+
+def _is_newer(record: Dict[str, Any], old: Sequence[Any]) -> bool:
+    incoming = _version_key(record)
+    old_key = (
+        old[0] if old[0] is not None else -1,
+        old[1] if old[1] is not None else -1,
+        _datetime(old[2]) or datetime.min,
+        _datetime(old[3]) or datetime.min,
+    )
+    return incoming > old_key
+
+
+def _version_values(record: Dict[str, Any]) -> tuple:
+    return (
+        _integer(record.get("versionNumber")),
+        _integer(record.get("correctionNumber")),
+        _datetime(record.get("versionTime")),
+        _datetime(record.get("correctionTime")),
+    )
+
+
+def _latest_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        key = record["deviceRecordKey"]
+        if key not in latest or _version_key(record) >= _version_key(latest[key]):
+            latest[key] = record
+    return list(latest.values())
+
+
+def _load_existing_versions(conn) -> Dict[str, tuple]:
     cursor = conn.cursor()
     try:
-        cursor.executemany(INSERT_DEVICE_SQL, device_rows)
-        for table in DETAIL_TABLES:
-            cursor.execute(f"DELETE FROM {table} WHERE device_record_key IN ({placeholders})", keys)
-        details = [_detail_rows(r) for r in records]
-        for table in DETAIL_TABLES:
-            rows = [row for d in details for row in d[table]]
-            if rows:
-                cursor.executemany(INSERT_DETAIL_SQL[table], rows)
+        cursor.execute(
+            "SELECT device_record_key,version_number,correction_number,version_time,correction_time "
+            "FROM udi_devices"
+        )
+        return {row[0]: row[1:] for row in cursor.fetchall()}
     finally:
         cursor.close()
 
 
-def _flush(conn, batch: List[Dict[str, Any]]) -> int:
-    """导入一批并提交，失败则回滚；返回失败条数。"""
-    try:
-        _import_batch(conn, batch)
-        conn.commit()
-        return 0
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"批次导入失败（{len(batch)} 条）: {e}")
-        return len(batch)
+def _accepted_records(
+    cursor,
+    records: List[Dict[str, Any]],
+    existing: Optional[Dict[str, tuple]] = None,
+) -> List[Dict[str, Any]]:
+    records = _latest_records(records)
+    if not records:
+        return []
 
-
-def _connect(config):
-    try:
-        return mysql.connector.connect(
-            host=config.db_host,
-            port=config.db_port,
-            database=config.db_name,
-            user=config.db_user,
-            password=config.db_password,
-            autocommit=False,
-            connection_timeout=30,
+    if existing is None:
+        keys = [record["deviceRecordKey"] for record in records]
+        placeholders = ",".join(["%s"] * len(keys))
+        cursor.execute(
+            "SELECT device_record_key,version_number,correction_number,version_time,correction_time "
+            f"FROM udi_devices WHERE device_record_key IN ({placeholders})",
+            keys,
         )
-    except mysql.connector.Error as e:
-        logger.error(f"数据库连接失败: {e}")
-        return None
+        existing = {row[0]: row[1:] for row in cursor.fetchall()}
+    return [
+        record
+        for record in records
+        if record["deviceRecordKey"] not in existing
+        or _is_newer(record, existing[record["deviceRecordKey"]])
+    ]
 
 
-def _log_import(conn, file_name: str, total: int, success: int, failed: int,
-                status: str, error: Optional[str], duration: float) -> None:
+def _device_row(record: Dict[str, Any]) -> List[Any]:
+    row = [converter(record.get(tag)) for tag, _, converter in DEVICE_SPECS]
+    row.extend(int(bool(record.get(flag))) for flag in FLAG_COLUMNS)
+    return row
+
+
+def _detail_rows(record: Dict[str, Any]) -> Dict[str, List[tuple]]:
+    key = record["deviceRecordKey"]
+    return {
+        "udi_packing_list": [
+            (
+                key,
+                number,
+                _clean(item.get("bzcpbs")),
+                _clean(item.get("cpbzjb")),
+                _integer(item.get("bznhxyjcpbssl")),
+                _clean(item.get("bznhxyjbzcpbs")),
+            )
+            for number, item in enumerate(record.get("packing_list", []), 1)
+        ],
+        "udi_storage_list": [
+            (
+                key,
+                number,
+                _clean(item.get("cchcztj")),
+                _clean(item.get("zdz")),
+                _clean(item.get("zgz")),
+                _clean(item.get("jldw")),
+            )
+            for number, item in enumerate(record.get("storage_list", []), 1)
+        ],
+        "udi_clinical_list": [
+            (
+                key,
+                number,
+                _clean(item.get("lcsycclx")),
+                _clean(item.get("ccz")),
+                _clean(item.get("ccdw")),
+            )
+            for number, item in enumerate(record.get("clinical_list", []), 1)
+        ],
+        "udi_contacts": [
+            (
+                key,
+                number,
+                _clean(item.get("qylxrcz")),
+                _clean(item.get("qylxryx")),
+                _clean(item.get("qylxrdh")),
+            )
+            for number, item in enumerate(record.get("contact_list", []), 1)
+        ],
+    }
+
+
+def _import_batch(
+    conn,
+    records: List[Dict[str, Any]],
+    existing: Optional[Dict[str, tuple]] = None,
+) -> List[Dict[str, Any]]:
+    cursor = conn.cursor()
+    try:
+        records = _accepted_records(cursor, records, existing)
+        if not records:
+            return []
+
+        cursor.executemany(INSERT_DEVICE_SQL, [_device_row(record) for record in records])
+        keys = [record["deviceRecordKey"] for record in records]
+        placeholders = ",".join(["%s"] * len(keys))
+        details = [_detail_rows(record) for record in records]
+
+        for table in DETAIL_TABLES:
+            cursor.execute(
+                f"DELETE FROM {table} WHERE device_record_key IN ({placeholders})",
+                keys,
+            )
+            rows = [row for detail in details for row in detail[table]]
+            if rows:
+                cursor.executemany(INSERT_DETAIL_SQL[table], rows)
+        return records
+    finally:
+        cursor.close()
+
+
+def _log_import(
+    conn,
+    file_name: str,
+    status: str,
+    total: int,
+    success: int,
+    failed: int,
+    error: Optional[str],
+    duration: float,
+) -> None:
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO import_logs (file_name, total_records, success_records, failed_records, "
-            "status, error_message, duration_seconds) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (file_name, total, success, failed, status, error, int(duration)),
-        )
-        conn.commit()
-        cursor.close()
-    except Exception as e:
-        logger.warning(f"记录导入日志失败: {e}")
+        try:
+            cursor.execute(
+                "INSERT INTO import_logs "
+                "(file_name,status,total_records,success_records,failed_records,error_message,duration_seconds) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (file_name, status, total, success, failed, error, int(duration)),
+            )
+            conn.commit()
+        finally:
+            cursor.close()
+    except mysql.connector.Error as log_error:
+        logger.warning("写入导入日志失败: %s", log_error)
 
 
-def import_records(config, file_name: str, record_generator: Generator) -> Dict[str, Any]:
-    """从解析生成器导入数据，返回汇总结果。"""
+def import_zip_file(
+    config,
+    path: Path,
+    preload_existing: bool = False,
+) -> Dict[str, Any]:
+    """Parse and import one ZIP. Database/parser errors are raised to the caller."""
+    started = time.monotonic()
+    total = 0
+    updated = 0
     conn = _connect(config)
-    if conn is None:
-        return {"status": "failed", "error": "数据库连接失败"}
-
-    start = time.time()
-    total = success = failed = 0
-    batch: List[Dict[str, Any]] = []
-
     try:
-        for record in record_generator:
+        existing = _load_existing_versions(conn) if preload_existing else None
+        if existing is not None:
+            logger.info("已加载 %s 条现有记录的版本信息", len(existing))
+        batch: List[Dict[str, Any]] = []
+        for record in parse_zip_file(str(path)):
             total += 1
             batch.append(record)
             if len(batch) >= BATCH_SIZE:
-                batch_failed = _flush(conn, batch)
-                failed += batch_failed
-                success += len(batch) - batch_failed
-                batch = []
+                accepted = _import_batch(conn, batch, existing)
+                conn.commit()
+                updated += len(accepted)
+                if existing is not None:
+                    existing.update(
+                        (record["deviceRecordKey"], _version_values(record))
+                        for record in accepted
+                    )
+                batch.clear()
+                if total % 100_000 == 0:
+                    logger.info("导入进度 %s: %s 条", path.name, total)
 
         if batch:
-            batch_failed = _flush(conn, batch)
-            failed += batch_failed
-            success += len(batch) - batch_failed
+            accepted = _import_batch(conn, batch, existing)
+            conn.commit()
+            updated += len(accepted)
+            if existing is not None:
+                existing.update(
+                    (record["deviceRecordKey"], _version_values(record))
+                    for record in accepted
+                )
 
-        duration = time.time() - start
-        status = "completed" if total > 0 and failed == 0 else "failed"
-        _log_import(conn, file_name, total, success, failed, status, None, duration)
-        logger.info(f"导入完成: {file_name} 共{total}条 成功{success} 失败{failed} 耗时{duration:.1f}s")
+        duration = time.monotonic() - started
+        _log_import(conn, path.name, "completed", total, total, 0, None, duration)
+        logger.info(
+            "导入完成: %s，解析 %s 条，新增或更新 %s 条，耗时 %.1f 秒",
+            path.name,
+            total,
+            updated,
+            duration,
+        )
         return {
-            "status": status,
+            "status": "completed",
             "total_records": total,
-            "success_records": success,
-            "failed_records": failed,
-            "duration_seconds": round(duration, 2),
+            "success_records": total,
+            "updated_records": updated,
+            "failed_records": 0,
         }
-
-    except Exception as e:
+    except Exception as error:
         conn.rollback()
-        duration = time.time() - start
-        logger.error(f"导入异常: {e}")
-        _log_import(conn, file_name, total, success, failed, "failed", str(e), duration)
-        return {
-            "status": "failed",
-            "error": str(e),
-            "total_records": total,
-            "success_records": success,
-            "failed_records": failed,
-        }
-
+        duration = time.monotonic() - started
+        _log_import(
+            conn,
+            path.name,
+            "failed",
+            total,
+            updated,
+            max(0, total - updated),
+            str(error),
+            duration,
+        )
+        raise
     finally:
         conn.close()

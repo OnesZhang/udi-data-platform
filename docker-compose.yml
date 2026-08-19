@@ -1,34 +1,41 @@
 services:
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: udi-app
+  downloader:
+    build: .
+    container_name: udi-downloader
+    command: ["download-daemon"]
     environment:
-      # 数据库配置（必填）
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
-      - DB_NAME=${DB_NAME}
-      - DB_USER=${DB_USER}
-      - DB_PASSWORD=${DB_PASSWORD}
-      # RSS配置（可选，有默认值）
-      - RSS_DAILY_URL=${RSS_DAILY_URL:-https://udi.nmpa.gov.cn/rss/download.html?files=daily}
-      # 文件目录配置
-      - INBOX_DIR=/app/inbox
-      # 时区（日志时间使用）
-      - TZ=${TZ:-Asia/Shanghai}
+      RSS_DAILY_URL: ${RSS_DAILY_URL:-https://udi.nmpa.gov.cn/rss/download.html?files=daily}
+      RSS_WEEKLY_URL: ${RSS_WEEKLY_URL:-https://udi.nmpa.gov.cn/rss/download.html?files=weekly}
+      RSS_MONTHLY_URL: ${RSS_MONTHLY_URL:-https://udi.nmpa.gov.cn/rss/download.html?files=monthly}
+      RSS_FULL_URL: ${RSS_FULL_URL:-https://udi.nmpa.gov.cn/rss/download.html?files=full}
+      INBOX_DIR: /data/inbox
+      ARCHIVE_DIR: /data/archive
+      FAILED_DIR: /data/failed
+      DOWNLOAD_INTERVAL_HOURS: ${DOWNLOAD_INTERVAL_HOURS:-24}
+      TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      - ./src:/app
-      - ./inbox:/app/inbox
-    restart: always
-    healthcheck:
-      test: ["CMD", "pgrep", "-f", "python app.py"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - ./inbox:/data/inbox
+      - ./archive:/data/archive
+      - ./failed:/data/failed
+    restart: unless-stopped
+
+  importer:
+    build: .
+    container_name: udi-importer
+    command: ["import-daemon"]
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      INBOX_DIR: /data/inbox
+      ARCHIVE_DIR: /data/archive
+      FAILED_DIR: /data/failed
+      IMPORT_POLL_SECONDS: ${IMPORT_POLL_SECONDS:-60}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./inbox:/data/inbox
+      - ./archive:/data/archive
+      - ./failed:/data/failed
+    restart: unless-stopped

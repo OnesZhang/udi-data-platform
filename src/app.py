@@ -1,93 +1,154 @@
 #!/usr/bin/env python3
-"""UDI 医疗器械数据平台 - 主入口（每日定时下载 + 导入）"""
+"""Command-line entry point for the independent downloader/importer services."""
 
+import argparse
 import logging
-import os
 import signal
 import sys
-import time
-from datetime import datetime, timedelta
+import threading
+from typing import Dict
+
+import mysql.connector
 
 from config import Config
-from db_initializer import initialize_database
-from downloader import download_latest, list_inbox_files
-from importer import import_records
-from parser import parse_zip_file
+from db_initializer import initialize_database, reset_database
+from downloader import download_feed
+from file_store import archive, list_ready_files, recover_processing, release_for_retry, reserve
+from importer import import_zip_file
+from parser import XMLParseError
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-INTERVAL_HOURS = 24
-shutdown_flag = False
+STOP = threading.Event()
 
 
-def signal_handler(signum, frame):
-    global shutdown_flag
-    logger.info("收到停止信号，正在关闭...")
-    shutdown_flag = True
+def _stop(signum, frame) -> None:
+    logger.info("收到停止信号，等待当前步骤结束")
+    STOP.set()
 
 
-def run_once(config):
-    """下载最新数据并处理 inbox 中的文件。"""
-    if download_latest(config):
-        logger.info("最新文件下载完成")
-    process_inbox(config)
+def _wait(seconds: int) -> None:
+    STOP.wait(max(1, seconds))
 
 
-def process_inbox(config):
-    files = list_inbox_files(config)
-    if not files:
-        logger.info("inbox 中没有 ZIP 文件")
-        return
-
-    for info in files:
-        path, name = info["path"], info["filename"]
-        logger.info(f"处理文件: {name}")
-        result = import_records(config, name, parse_zip_file(path))
-        if result.get("status") == "completed" and result.get("failed_records", 0) == 0:
-            os.remove(path)
-            logger.info(f"导入成功，已删除文件: {name}")
-        else:
-            logger.error(f"导入未完成，保留文件待下次重试: {result}")
+def run_downloader_once(config: Config, feed: str) -> int:
+    files = download_feed(config, config.rss_url(feed), feed)
+    logger.info("%s RSS 本次下载 %s 个文件", feed, len(files))
+    return len(files)
 
 
-def run_loop(config):
-    while not shutdown_flag:
+def run_downloader_daemon(config: Config) -> None:
+    while not STOP.is_set():
+        run_downloader_once(config, "daily")
+        _wait(config.download_interval_hours * 3600)
+
+
+def process_inbox(config: Config, preload_existing: bool = False) -> Dict[str, int]:
+    """Import every complete ZIP currently in inbox, regardless of its source."""
+    outcomes = {"completed": 0, "failed": 0, "retry": 0}
+    for ready_path in list_ready_files(config):
+        if STOP.is_set():
+            break
+
+        processing_path = reserve(config, ready_path)
+        if processing_path is None:
+            continue
+
         try:
-            run_once(config)
-            next_run = datetime.now() + timedelta(hours=INTERVAL_HOURS)
-            logger.info(f"下次执行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-        except Exception as e:
-            logger.error(f"任务执行异常: {e}")
+            result = import_zip_file(
+                config,
+                processing_path,
+                preload_existing=preload_existing,
+            )
+        except mysql.connector.Error as error:
+            logger.error("数据库暂不可用，文件留在 inbox 等待重试: %s", error)
+            release_for_retry(config, processing_path)
+            outcomes["retry"] += 1
+            break
+        except (XMLParseError, OSError, ValueError) as error:
+            logger.exception("文件解析失败，移入 failed: %s", error)
+            archive(config, processing_path, failed=True)
+            outcomes["failed"] += 1
+            continue
+        except Exception as error:
+            logger.exception("文件导入失败，移入 failed: %s", error)
+            archive(config, processing_path, failed=True)
+            outcomes["failed"] += 1
+            continue
 
-        for _ in range(INTERVAL_HOURS * 60):
-            if shutdown_flag:
-                break
-            time.sleep(60)
+        archive(config, processing_path)
+        outcomes["completed"] += 1
+        logger.info("文件已归档: %s (%s)", processing_path.name, result)
+    return outcomes
 
 
-def main():
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    logger.info("UDI 医疗器械数据平台启动")
+def _prepare_database(config: Config, reset: bool = False) -> None:
+    if reset and not reset_database(config):
+        raise RuntimeError("测试数据库重置失败")
+    if not initialize_database(config):
+        raise RuntimeError("数据库初始化失败")
 
-    try:
-        config = Config()
-        if not initialize_database(config):
-            sys.exit("数据库初始化失败")
 
-        run_once(config)
-        logger.info(f"进入定时模式，每 {INTERVAL_HOURS} 小时执行一次")
-        run_loop(config)
-    except Exception as e:
-        logger.error(f"系统异常退出: {e}")
-        sys.exit(1)
-    finally:
-        logger.info("系统已停止")
+def run_importer_once(config: Config, reset: bool = False) -> Dict[str, int]:
+    _prepare_database(config, reset)
+    recover_processing(config)
+    return process_inbox(config, preload_existing=True)
+
+
+def run_importer_daemon(config: Config) -> None:
+    _prepare_database(config)
+    recover_processing(config)
+    while not STOP.is_set():
+        outcomes = process_inbox(config)
+        if any(outcomes.values()):
+            logger.info("本轮处理结果: %s", outcomes)
+        _wait(config.poll_seconds)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="UDI 下载与导入服务")
+    parser.add_argument(
+        "--mode",
+        choices=("download-daemon", "download-once", "import-daemon", "import-once"),
+        default="import-daemon",
+    )
+    parser.add_argument(
+        "--feed",
+        choices=("daily", "weekly", "monthly", "full"),
+        default="daily",
+        help="download-once 使用的 RSS 类型",
+    )
+    parser.add_argument(
+        "--reset-db",
+        action="store_true",
+        help="删除并重建配置中的测试数据库，仅用于 import-once",
+    )
+    args = parser.parse_args()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    download_mode = args.mode.startswith("download")
+    if args.reset_db and args.mode != "import-once":
+        parser.error("--reset-db 仅可用于 import-once")
+
+    config = Config(require_database=not download_mode)
+    if args.mode == "download-daemon":
+        run_downloader_daemon(config)
+    elif args.mode == "download-once":
+        run_downloader_once(config, args.feed)
+    elif args.mode == "import-daemon":
+        run_importer_daemon(config)
+    else:
+        logger.info("本次处理结果: %s", run_importer_once(config, args.reset_db))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        logger.exception("服务异常退出: %s", error)
+        sys.exit(1)

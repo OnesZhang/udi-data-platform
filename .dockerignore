@@ -10,3 +10,8 @@ venv/
 .vscode
 .idea
 *.md
+external/
+inbox/
+archive/
+failed/
+.env

@@ -1,70 +1,91 @@
 #!/usr/bin/env python3
-"""RSS 订阅下载模块 - 下载每日 UDI 数据到 inbox 目录"""
+"""RSS downloader. It only downloads ZIP files into inbox/."""
 
 import logging
 import os
+import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
-import feedparser
 import requests
 
-logger = logging.getLogger(__name__)
+from file_store import already_seen, is_complete_zip, safe_zip_filename
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+logger = logging.getLogger(__name__)
+HEADERS = {"User-Agent": "UDI-data-downloader/1.0"}
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _child_text(element: ET.Element, name: str) -> str:
+    for child in element:
+        if _local_name(child.tag) == name:
+            return (child.text or "").strip()
+    return ""
 
 
 def fetch_rss(url: str):
     try:
         response = requests.get(url, timeout=30, headers=HEADERS)
         response.raise_for_status()
-        feed = feedparser.parse(response.content)
-        if feed.entries:
-            logger.info(f"RSS 获取成功，共 {len(feed.entries)} 个条目")
-            return feed
-        logger.warning("RSS 中没有条目")
-    except Exception as e:
-        logger.error(f"RSS 获取失败: {e}")
-    return None
-
-
-def download_latest(config) -> Optional[str]:
-    """下载最新每日数据到 inbox，文件已存在则跳过。"""
-    feed = fetch_rss(config.rss_daily_url)
-    if feed is None:
-        return None
-
-    entry = feed.entries[0]
-    title = (entry.get("title") or "").strip()
-    filename = title if title.endswith(".zip") else datetime.now().strftime("UDID_DAILY_%Y%m%d.zip")
-    filepath = os.path.join(config.inbox_dir, filename)
-
-    if os.path.exists(filepath):
-        logger.info(f"文件已存在，跳过下载: {filepath}")
-        return filepath
-
-    try:
-        response = requests.get(entry.get("link"), stream=True, timeout=300, headers=HEADERS)
-        response.raise_for_status()
-        with open(filepath, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        logger.info(f"下载完成: {filepath} ({os.path.getsize(filepath) / 1024 / 1024:.1f}MB)")
-        return filepath
-    except Exception as e:
-        logger.error(f"下载失败: {e}")
-        if os.path.exists(filepath):
-            os.remove(filepath)
-        return None
-
-
-def list_inbox_files(config) -> List[dict]:
-    """列出 inbox 目录中的 ZIP 文件，按文件名倒序。"""
-    if not os.path.isdir(config.inbox_dir):
+        root = ET.fromstring(response.content)
+    except (requests.RequestException, ET.ParseError) as error:
+        logger.error("RSS 获取失败: %s", error)
         return []
-    return [
-        {"filename": name, "path": os.path.join(config.inbox_dir, name)}
-        for name in sorted(os.listdir(config.inbox_dir), reverse=True)
-        if name.endswith(".zip")
-    ]
+
+    entries = []
+    for element in root.iter():
+        if _local_name(element.tag) not in ("item", "entry"):
+            continue
+        link = _child_text(element, "link")
+        if not link:
+            for child in element:
+                if _local_name(child.tag) == "link":
+                    link = child.attrib.get("href", "").strip()
+                    break
+        entries.append({"title": _child_text(element, "title"), "link": link})
+    logger.info("RSS 获取成功，共 %s 个条目", len(entries))
+    return entries
+
+
+def download_feed(config, url: str, source_name: str) -> List[str]:
+    """Download every RSS entry that is not already present in the file store."""
+    downloaded = []
+    for index, entry in enumerate(fetch_rss(url), 1):
+        link = entry["link"]
+        if not link:
+            continue
+
+        fallback = f"UDI_{source_name.upper()}_{datetime.now():%Y%m%d}_{index}.zip"
+        file_name = safe_zip_filename(entry["title"], fallback)
+        if already_seen(config, file_name):
+            logger.info("文件已存在，跳过下载: %s", file_name)
+            continue
+
+        target = config.inbox_dir / file_name
+        part = config.inbox_dir / f".{file_name}.{uuid.uuid4().hex}.part"
+        try:
+            with requests.get(
+                link,
+                stream=True,
+                timeout=(30, 600),
+                headers=HEADERS,
+            ) as response:
+                response.raise_for_status()
+                with part.open("xb") as output:
+                    for chunk in response.iter_content(1024 * 1024):
+                        if chunk:
+                            output.write(chunk)
+
+            if not is_complete_zip(part):
+                raise ValueError("下载结果不是完整的 XML ZIP 文件")
+            os.replace(part, target)
+            downloaded.append(file_name)
+            logger.info("下载完成，已投递 inbox: %s", file_name)
+        except (OSError, ValueError, requests.RequestException) as error:
+            part.unlink(missing_ok=True)
+            logger.error("下载失败 %s: %s", file_name, error)
+    return downloaded
