@@ -6,7 +6,7 @@ import logging
 import re
 import zipfile
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, Generator, Optional
+from typing import Any, Dict, Generator, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,7 @@ NUMERIC_ENTITY_RE = re.compile(r"&#(?:[0-9]+|[xX][0-9A-Fa-f]+);")
 CDATA_RE = re.compile(r"(<!\[CDATA\[.*?\]\]>)", re.DOTALL)
 XML_DECLARATION_RE = re.compile(r"^\s*<\?xml[^>]*\?>", re.IGNORECASE)
 PART_NUMBER_RE = re.compile(r"PART(\d+)", re.IGNORECASE)
+MAX_NESTED_ZIP_DEPTH = 8
 
 
 class XMLParseError(ValueError):
@@ -115,22 +116,27 @@ def _normalize_xml(content: str):
     return _clean_xml(content), invalid_count
 
 
-def _read_normalized_xml(archive: zipfile.ZipFile, name: str, log_cleanup: bool) -> str:
+def _read_normalized_xml(
+    archive: zipfile.ZipFile,
+    member: zipfile.ZipInfo,
+    display_name: str,
+    log_cleanup: bool,
+) -> str:
     try:
-        raw = archive.read(name)
-    except (KeyError, OSError, zipfile.BadZipFile) as error:
-        raise XMLParseError(f"读取 XML 失败 {name}: {error}") from error
+        raw = archive.read(member)
+    except (KeyError, OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as error:
+        raise XMLParseError(f"读取 XML 失败 {display_name}: {error}") from error
 
     try:
         content = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
-        raise XMLParseError(f"{name}: 不是有效的 UTF-8 XML: {error}") from error
+        raise XMLParseError(f"{display_name}: 不是有效的 UTF-8 XML: {error}") from error
     if content.startswith("\ufeff"):
         content = content[1:]
 
     normalized, invalid_count = _normalize_xml(content)
     if log_cleanup and invalid_count:
-        logger.warning("%s: 已移除 %s 个 XML 1.0 非法字符", name, invalid_count)
+        logger.warning("%s: 已移除 %s 个 XML 1.0 非法字符", display_name, invalid_count)
     return normalized
 
 
@@ -259,40 +265,72 @@ def _xml_sort_key(name: str):
     return (int(match.group(1)) if match else 0, name)
 
 
+def _iter_xml_members(
+    archive: zipfile.ZipFile,
+    archive_name: str,
+    depth: int = 0,
+) -> Generator[Tuple[zipfile.ZipFile, zipfile.ZipInfo, str], None, None]:
+    """Yield XML members from an archive and nested ZIP members in sort order."""
+    members = sorted(
+        (member for member in archive.infolist() if not member.is_dir()),
+        key=lambda member: _xml_sort_key(member.filename),
+    )
+    for member in members:
+        member_name = f"{archive_name}!{member.filename}"
+        lower_name = member.filename.lower()
+        if lower_name.endswith(".xml"):
+            yield archive, member, member_name
+            continue
+        if not lower_name.endswith(".zip"):
+            continue
+        if depth >= MAX_NESTED_ZIP_DEPTH:
+            raise XMLParseError(
+                f"{member_name}: ZIP 嵌套层数超过 {MAX_NESTED_ZIP_DEPTH} 层"
+            )
+
+        try:
+            nested_bytes = archive.read(member)
+            nested_archive = zipfile.ZipFile(io.BytesIO(nested_bytes), "r")
+        except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as error:
+            raise XMLParseError(f"无法打开嵌套 ZIP {member_name}: {error}") from error
+
+        with nested_archive:
+            yield from _iter_xml_members(nested_archive, member_name, depth + 1)
+
+
 def parse_zip_file(zip_path: str) -> Generator[Dict[str, Any], None, None]:
-    """Validate every XML in a ZIP, then yield each device exactly once."""
+    """Validate every XML in a ZIP tree, then yield each device exactly once."""
     try:
         archive = zipfile.ZipFile(zip_path, "r")
     except (OSError, zipfile.BadZipFile) as error:
         raise XMLParseError(f"无法打开 ZIP: {zip_path}: {error}") from error
 
     with archive:
-        names = sorted(
-            (name for name in archive.namelist() if name.lower().endswith(".xml")),
-            key=_xml_sort_key,
-        )
-        if not names:
-            raise XMLParseError("ZIP 中没有 XML 文件")
-        if len(names) != len(set(names)):
-            raise XMLParseError("ZIP 中存在重复的 XML 文件名")
-
-        logger.info("解析 %s，共 %s 个 XML 文件", zip_path, len(names))
-
         # The complete validation pass prevents a malformed later XML from
         # causing earlier records to be emitted and then emitted again on retry.
-        expected_counts = {}
+        expected_counts: Dict[str, int] = {}
         expected_total = 0
-        for name in names:
-            content = _read_normalized_xml(archive, name, log_cleanup=True)
+        for source_archive, member, name in _iter_xml_members(archive, zip_path):
+            if name in expected_counts:
+                raise XMLParseError("ZIP 中存在重复的 XML 文件名")
+            content = _read_normalized_xml(source_archive, member, name, log_cleanup=True)
             declared_count = _validate_xml(content, name)
             expected_counts[name] = declared_count
             expected_total += declared_count
 
+        if not expected_counts:
+            raise XMLParseError("ZIP 中没有 XML 文件")
+
+        logger.info("解析 %s，共 %s 个 XML 文件", zip_path, len(expected_counts))
         logger.info("XML 完整性校验通过，确认 %s 条记录", expected_total)
 
         total = 0
-        for name in names:
-            content = _read_normalized_xml(archive, name, log_cleanup=False)
+        extracted_names = set()
+        for source_archive, member, name in _iter_xml_members(archive, zip_path):
+            if name not in expected_counts or name in extracted_names:
+                raise XMLParseError(f"{name}: XML 文件在提取阶段结构发生变化")
+            extracted_names.add(name)
+            content = _read_normalized_xml(source_archive, member, name, log_cleanup=False)
             extracted_count = 0
             for record in _extract_xml_records(content, name):
                 extracted_count += 1
@@ -303,6 +341,8 @@ def parse_zip_file(zip_path: str) -> Generator[Dict[str, Any], None, None]:
                     f"{name}: 校验阶段声明 {expected_counts[name]} 条，提取阶段得到 {extracted_count} 条"
                 )
 
+        if len(extracted_names) != len(expected_counts):
+            raise XMLParseError("ZIP 中 XML 文件在提取阶段结构发生变化")
         if total != expected_total:
             raise XMLParseError(f"ZIP 记录数异常：校验 {expected_total} 条，提取 {total} 条")
         logger.info("解析完成，共 %s 条记录", total)
