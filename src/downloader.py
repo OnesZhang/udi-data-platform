@@ -4,7 +4,7 @@
 import logging
 import os
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 
 import feedparser
 import requests
@@ -36,8 +36,9 @@ def download_latest(config) -> Optional[str]:
 
     entry = feed.entries[0]
     title = (entry.get("title") or "").strip()
-    filename = title if title.endswith(".zip") else datetime.now().strftime("UDID_DAILY_%Y%m%d.zip")
+    filename = os.path.basename(title) if title.endswith(".zip") else datetime.now().strftime("UDID_DAILY_%Y%m%d.zip")
     filepath = os.path.join(config.inbox_dir, filename)
+    temporary_path = f"{filepath}.download"
 
     if os.path.exists(filepath):
         logger.info(f"文件已存在，跳过下载: {filepath}")
@@ -46,25 +47,21 @@ def download_latest(config) -> Optional[str]:
     try:
         response = requests.get(entry.get("link"), stream=True, timeout=300, headers=HEADERS)
         response.raise_for_status()
-        with open(filepath, "wb") as f:
+        with open(temporary_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
+
+        # Do not expose a partially downloaded ZIP to the inbox worker.
+        if os.path.exists(filepath):
+            logger.info(f"目标文件已存在，保留现有文件并跳过 RSS 下载: {filepath}")
+            os.remove(temporary_path)
+            return filepath
+        os.replace(temporary_path, filepath)
         logger.info(f"下载完成: {filepath} ({os.path.getsize(filepath) / 1024 / 1024:.1f}MB)")
         return filepath
     except Exception as e:
         logger.error(f"下载失败: {e}")
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
         return None
-
-
-def list_inbox_files(config) -> List[dict]:
-    """列出 inbox 目录中的 ZIP 文件，按文件名倒序。"""
-    if not os.path.isdir(config.inbox_dir):
-        return []
-    return [
-        {"filename": name, "path": os.path.join(config.inbox_dir, name)}
-        for name in sorted(os.listdir(config.inbox_dir), reverse=True)
-        if name.endswith(".zip")
-    ]

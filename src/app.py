@@ -2,7 +2,6 @@
 """UDI 医疗器械数据平台 - 主入口（每日定时下载 + 导入）"""
 
 import logging
-import os
 import signal
 import sys
 import time
@@ -10,9 +9,8 @@ from datetime import datetime, timedelta
 
 from config import Config
 from db_initializer import initialize_database
-from downloader import download_latest, list_inbox_files
-from importer import import_records
-from parser import parse_zip_file
+from downloader import download_latest
+from inbox_worker import FILE_STABLE_SECONDS, InboxWorker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,7 +18,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-INTERVAL_HOURS = 24
+RSS_INTERVAL_HOURS = 24
+INBOX_POLL_SECONDS = 15
 shutdown_flag = False
 
 
@@ -30,43 +29,33 @@ def signal_handler(signum, frame):
     shutdown_flag = True
 
 
-def run_once(config):
-    """下载最新数据并处理 inbox 中的文件。"""
-    if download_latest(config):
-        logger.info("最新文件下载完成")
-    process_inbox(config)
+def _wait_for_next_scan(seconds):
+    """Sleep in short intervals so SIGTERM is handled promptly."""
+    end_time = time.monotonic() + seconds
+    while not shutdown_flag:
+        remaining = end_time - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(1, remaining))
 
 
-def process_inbox(config):
-    files = list_inbox_files(config)
-    if not files:
-        logger.info("inbox 中没有 ZIP 文件")
-        return
-
-    for info in files:
-        path, name = info["path"], info["filename"]
-        logger.info(f"处理文件: {name}")
-        result = import_records(config, name, parse_zip_file(path))
-        if result.get("status") == "completed" and result.get("failed_records", 0) == 0:
-            os.remove(path)
-            logger.info(f"导入成功，已删除文件: {name}")
-        else:
-            logger.error(f"导入未完成，保留文件待下次重试: {result}")
-
-
-def run_loop(config):
+def run_loop(config, inbox_worker):
+    """Poll inbox frequently while checking the RSS feed once per day."""
+    next_rss_run = datetime.now()
     while not shutdown_flag:
         try:
-            run_once(config)
-            next_run = datetime.now() + timedelta(hours=INTERVAL_HOURS)
-            logger.info(f"下次执行时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+            inbox_worker.process_ready_files()
+
+            now = datetime.now()
+            if now >= next_rss_run:
+                if download_latest(config):
+                    logger.info("最新 RSS 文件下载完成，等待收件箱处理")
+                next_rss_run = now + timedelta(hours=RSS_INTERVAL_HOURS)
+                logger.info(f"下次 RSS 检查时间: {next_rss_run.strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception as e:
             logger.error(f"任务执行异常: {e}")
 
-        for _ in range(INTERVAL_HOURS * 60):
-            if shutdown_flag:
-                break
-            time.sleep(60)
+        _wait_for_next_scan(INBOX_POLL_SECONDS)
 
 
 def main():
@@ -79,9 +68,14 @@ def main():
         if not initialize_database(config):
             sys.exit("数据库初始化失败")
 
-        run_once(config)
-        logger.info(f"进入定时模式，每 {INTERVAL_HOURS} 小时执行一次")
-        run_loop(config)
+        inbox_worker = InboxWorker(config)
+        logger.info(
+            "进入运行模式：每 %s 秒检查 inbox，文件稳定 %s 秒后导入；RSS 每 %s 小时检查一次",
+            INBOX_POLL_SECONDS,
+            FILE_STABLE_SECONDS,
+            RSS_INTERVAL_HOURS,
+        )
+        run_loop(config, inbox_worker)
     except Exception as e:
         logger.error(f"系统异常退出: {e}")
         sys.exit(1)

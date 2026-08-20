@@ -11,16 +11,17 @@
 
 - 🔄 **自动化数据同步**：通过RSS订阅自动下载每日更新数据
 - 📦 **全量数据支持**：支持解析UDI全量发布数据（ZIP格式）
-- 🗄️ **高性能存储**：MySQL数据库存储，支持600万+记录高效查询
+- 🗄️ **MySQL存储**：使用索引支持常用 UDI 字段查询
 - 🐳 **Docker容器化**：一键部署，长期稳定运行
-- ⏰ **定时任务**：每24小时自动检查并处理新数据
+- ⏰ **自动处理**：启动后立即检查 RSS，之后每 24 小时检查一次，同时自动处理手动上传到 inbox 的 ZIP 文件
 - 🔧 **灵活配置**：支持环境变量配置，无硬编码
 
 ## 📋 前置要求
 
 - Docker 20.10+
-- Docker Compose 2.0+
+- Docker Compose 插件 2.0+
 - MySQL 5.7+ 数据库服务器
+- 容器可访问 MySQL 服务和 NMPA RSS 地址
 
 ## 🚀 快速开始
 
@@ -36,7 +37,7 @@ cd udi-data-platform
 复制并编辑 `.env` 文件：
 
 ```bash
-cp .env.example .env  # 如果有的话
+cp .env.example .env
 ```
 
 编辑 `.env` 文件，填写数据库配置：
@@ -51,29 +52,32 @@ DB_PASSWORD=your-password
 
 # 可选配置
 RSS_DAILY_URL=https://udi.nmpa.gov.cn/rss/download.html?files=daily
+TZ=Asia/Shanghai
 ```
+
+首次启动时，程序会自动创建不存在的数据库和全部数据表。数据库账号需具备创建数据库、创建表及数据读写权限。
 
 ### 3. 启动服务
 
 ```bash
 # 构建并启动
-docker-compose up -d
+docker compose up -d
 
 # 查看日志
-docker-compose logs -f
+docker compose logs -f
 
 # 查看状态
-docker-compose ps
+docker compose ps
 ```
 
 ### 4. 验证安装
 
 ```bash
-# 查看应用日志，确认数据库连接成功
-docker-compose logs | grep "MySQL连接成功"
+# 查看应用日志，确认数据库已初始化
+docker compose logs app | grep -E "数据库初始化完成|数据表已存在"
 
 # 查看容器状态
-docker-compose ps
+docker compose ps
 ```
 
 ## 📁 项目结构
@@ -86,7 +90,8 @@ udi-data-platform/
 │   └── .dockerignore           # Docker忽略文件
 │
 ├── 📝 配置文件
-│   ├── .env                    # 环境变量配置（需填写）
+│   ├── .env.example            # 环境变量模板
+│   ├── .env                    # 本地环境变量配置（自行创建，不提交）
 │   ├── .gitignore              # Git忽略配置
 │   └── startup.sh              # 容器启动脚本
 │
@@ -95,18 +100,18 @@ udi-data-platform/
 │   ├── config.py               # 配置管理模块
 │   ├── db_initializer.py       # 数据库初始化
 │   ├── downloader.py           # RSS下载模块
+│   ├── inbox_worker.py          # inbox文件稳定性检测与导入调度
 │   ├── parser.py               # XML解析器
 │   ├── importer.py             # 数据导入器
 │   ├── init_db_complete.sql    # 数据库表结构
 │   └── requirements.txt        # Python依赖
 │
 ├── 📂 数据目录
-│   ├── inbox/                  # 待处理数据文件入口
-│   └── external/               # 项目外资源
-│       ├── config/             # RSS配置等
-│       ├── docs/               # 文档资料
-│       ├── downloads/          # 已下载数据
-│       └── legacy/             # 历史数据
+│   └── inbox/                  # 待处理数据文件入口
+│
+├── 🧪 测试 (tests/)
+│   ├── test_inbox_worker.py    # inbox处理流程测试
+│   └── test_parser.py          # XML解析测试
 │
 └── 📄 文档
     └── README.md               # 项目说明
@@ -118,12 +123,13 @@ udi-data-platform/
 
 | 表名 | 描述 | 主要字段 |
 |------|------|----------|
-| `udi_devices` | 设备主表 | 60个字段，存储设备核心信息 |
+| `udi_devices` | 设备主表 | 51列，存储设备核心信息 |
 | `udi_packing_list` | 包装列表 | 包装层级、规格等 |
 | `udi_storage_list` | 储存条件 | 温度、湿度等储存要求 |
 | `udi_clinical_list` | 临床尺寸 | 临床使用相关尺寸 |
 | `udi_contacts` | 联系人信息 | 企业联系信息 |
 | `import_logs` | 导入日志 | 数据导入记录 |
+| `import_error_records` | 单条导入错误 | 无法导入的设备记录及字段错误 |
 
 ## ⚙️ 配置说明
 
@@ -137,7 +143,8 @@ udi-data-platform/
 | `DB_USER` | ✅ | - | 数据库用户名 |
 | `DB_PASSWORD` | ✅ | - | 数据库密码 |
 | `RSS_DAILY_URL` | ❌ | 官方RSS | 每日数据RSS地址 |
-| `INBOX_DIR` | ❌ | /app/inbox | 数据文件目录 |
+| `INBOX_DIR` | ❌ | `/app/inbox` | Docker Compose 固定为此路径，并挂载宿主机 `./inbox/` |
+| `TZ` | ❌ | `Asia/Shanghai` | 容器日志时区 |
 
 ## 🔄 工作流程
 
@@ -145,63 +152,69 @@ udi-data-platform/
 graph TD
     A[容器启动] --> B[加载配置]
     B --> C[初始化数据库]
-    C --> D[测试数据库连接]
-    D --> E[首次执行: 下载+处理]
-    E --> F[进入定时循环 24h]
-    F --> G[检查RSS更新]
-    G --> H{有新文件?}
-    H -->|是| I[下载到inbox/]
-    H -->|否| J[等待]
-    I --> K[扫描inbox/]
-    K --> L[解析XML文件]
-    L --> M[导入MySQL]
-    M --> J
-    J --> F
+    C --> D[启动后立即扫描 inbox]
+    D --> E{ZIP已稳定且完整?}
+    E -->|是| F[解析XML并导入MySQL]
+    E -->|否| K
+    F --> G{导入结果}
+    G -->|全部成功| H[删除ZIP文件]
+    G -->|仅个别数据异常| I[记录异常并删除ZIP文件]
+    G -->|XML或系统异常| J[保留文件待重试]
+    H --> K
+    I --> K
+    J --> K
+    K{首次启动或到 RSS 检查时间?}
+    K -->|是| L[下载最新ZIP至 inbox]
+    K -->|否| M[等待15秒]
+    L --> M
+    M --> D
 ```
 
 ## 🛠️ 运维命令
 
 ```bash
 # 启动服务
-docker-compose up -d
+docker compose up -d
 
 # 停止服务
-docker-compose down
+docker compose down
 
 # 重启服务
-docker-compose restart
+docker compose restart
 
 # 查看实时日志
-docker-compose logs -f
+docker compose logs -f
 
 # 查看最近日志
-docker-compose logs --tail 100
+docker compose logs --tail 100
 
 # 进入容器
-docker-compose exec app bash
+docker compose exec app bash
 
 # 查看容器状态
-docker-compose ps
+docker compose ps
 
-# 手动触发数据处理（重启容器）
-docker-compose restart app
+# 重启服务
+docker compose restart app
 ```
+
+服务配置了 `restart: always`，Docker 或容器重启后会自动恢复运行。
 
 ## 📦 数据导入
 
 ### 自动导入（推荐）
 
-系统会自动通过RSS下载最新数据并处理，无需手动干预。
+服务启动后会立即检查一次 RSS，之后每 24 小时检查一次并下载最新数据；下载后的 ZIP 由 inbox 流程自动处理。
 
 ### 手动导入
 
-将ZIP格式的UDI数据文件放入 `inbox/` 目录：
+将ZIP格式的UDI数据文件直接放入 `inbox/` 目录：
 
 ```bash
 cp /path/to/UDID_*.zip inbox/
 ```
 
-系统会在下一个检查周期自动处理该文件。
+无需重启服务。系统默认每 15 秒检查一次；文件连续 60 秒没有变化且 ZIP 结构完整、所有 XML 记录数校验通过后，才会开始导入。XML 必须为 UTF-8 编码；解析器会在内存中清理 XML 1.0 非法字符和未转义的 `&`。全部导入成功或仅有个别数据字段异常时，文件都会自动删除；字段异常会记录到 `import_error_records`，XML、数据库或系统异常则保留文件并在 60 秒后重试。上传中的文件不会被打断。
 
 ## 🔍 故障排查
 
@@ -210,31 +223,30 @@ cp /path/to/UDID_*.zip inbox/
 检查 `.env` 文件中的数据库配置是否正确：
 
 ```bash
-docker-compose logs | grep "数据库连接失败"
+docker compose logs app | grep "数据库连接失败"
 ```
 
 ### 2. 下载失败
 
-检查网络连接和RSS地址：
+检查网络连接、RSS 地址和下载链接：
 
 ```bash
-docker-compose logs | grep "下载失败"
+docker compose logs app | grep -E "RSS 获取失败|下载失败"
 ```
 
-### 3. XML解析错误
+### 3. XML 解析失败
 
-系统在解析失败时会自动清理无效字符后重试。查看日志获取详情：
+解析器会在内存中清理 XML 1.0 非法字符和未转义的 `&`；无法解析的文件会保留在 inbox，并在 60 秒后重试。查看日志获取详情：
 
 ```bash
-docker-compose logs | grep "解析错误"
+docker compose logs app | grep -E "导入异常|XML 解析失败"
 ```
 
-## 📊 性能指标
+## 🧪 测试
 
-- **处理速度**：约 1000条/秒（受硬件影响）
-- **存储容量**：支持 600万+ 条记录
-- **文件大小**：支持 300MB+ ZIP文件
-- **内存占用**：约 500MB-1GB
+```bash
+python3 -B -m unittest discover -s tests -v
+```
 
 ## 🤝 贡献指南
 

@@ -28,18 +28,18 @@ CREATE TABLE IF NOT EXISTS udi_devices (
     qxlb VARCHAR(50) COMMENT '器械类别',
     flbm VARCHAR(50) COMMENT '分类编码',
     tyshxydm VARCHAR(100) COMMENT '统一社会信用代码',
-    zczbhhzbapzbh VARCHAR(100) COMMENT '注册证号/备案凭证号',
+    zczbhhzbapzbh TEXT COMMENT '注册证号/备案凭证号',
     ylqxzcrbarmc VARCHAR(500) COMMENT '注册人/备案人名称',
     ylqxzcrbarywmc VARCHAR(500) COMMENT '注册人/备案人英文名称',
-    ybbm VARCHAR(500) COMMENT '医保编码',
+    ybbm TEXT COMMENT '医保编码',
     cplb VARCHAR(50) COMMENT '产品类别',
     cgzmraqxgxx VARCHAR(500) COMMENT '采购周期风险更新信息',
     sfbjwycxsy VARCHAR(10) COMMENT '是否包含唯一标识信息',
     zdcfsycs VARCHAR(100) COMMENT '最大重复使用次数',
     sfwwjbz VARCHAR(10) COMMENT '是否为无菌包装',
     syqsfxyjxmj VARCHAR(10) COMMENT '使用前是否需要进行灭菌',
-    mjfs VARCHAR(200) COMMENT '灭菌方式',
-    qtxxdwzlj VARCHAR(100) COMMENT '其他信息位置链接',
+    mjfs TEXT COMMENT '灭菌方式',
+    qtxxdwzlj TEXT COMMENT '其他信息位置链接',
     tsrq DATE COMMENT '提交日期',
     scbssfbhph VARCHAR(10) COMMENT '生产标识是否包含批次号',
     scbssfbhxlh VARCHAR(10) COMMENT '生产标识是否包含序列号',
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS udi_devices (
     version_time DATE COMMENT '版本时间',
     version_status VARCHAR(20) COMMENT '版本状态',
     correction_number INT COMMENT '更正次数',
-    correction_remark VARCHAR(500) COMMENT '更正备注',
+    correction_remark TEXT COMMENT '更正备注',
     correction_time DATE COMMENT '更正时间',
     
     -- 嵌套字段标记
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS udi_devices (
     KEY idx_cpbsbmtxmc (cpbsbmtxmc),
     KEY idx_cpmctymc (cpmctymc),
     KEY idx_ylqxzcrbarmc (ylqxzcrbarmc),
-    KEY idx_zczbhhzbapzbh (zczbhhzbapzbh),
+    KEY idx_zczbhhzbapzbh (zczbhhzbapzbh(191)),
     KEY idx_version_time (version_time),
     KEY idx_version_status (version_status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='UDI设备主表';
@@ -139,7 +139,23 @@ CREATE TABLE IF NOT EXISTS import_logs (
     total_records INT,
     success_records INT,
     failed_records INT,
-    status ENUM('running', 'completed', 'failed'),
+    status ENUM('running', 'completed', 'completed_with_errors', 'failed'),
     error_message TEXT,
     duration_seconds INT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='数据导入日志表';
+
+-- ============================================
+-- 7. 单条导入错误记录表
+-- ============================================
+CREATE TABLE IF NOT EXISTS import_error_records (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    error_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    file_name VARCHAR(200) NOT NULL,
+    device_record_key VARCHAR(100),
+    error_code INT,
+    affected_column VARCHAR(100),
+    error_message TEXT NOT NULL,
+
+    KEY idx_error_file_name (file_name),
+    KEY idx_error_device_record_key (device_record_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='单条数据导入错误记录';

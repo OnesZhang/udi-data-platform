@@ -18,15 +18,8 @@ services:
       # 时区（日志时间使用）
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
-      - ./src:/app
       - ./inbox:/app/inbox
     restart: always
-    healthcheck:
-      test: ["CMD", "pgrep", "-f", "python app.py"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
     logging:
       driver: "json-file"
       options:

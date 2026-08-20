@@ -40,9 +40,6 @@ Thumbs.db
 inbox/*
 !inbox/.gitkeep
 
-# External - 项目外资源（包含敏感信息，不提交）
-external/
-
 # Temporary files
 *~
 *.tmp

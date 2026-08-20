@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
-"""
-UDI XML 解析器
+"""Parse official UDI XML files from a ZIP archive."""
 
-将 ZIP 内的 XML 逐条解析为设备记录字典。字段名沿用官方 XML 标签
-（含官方拼写 versionStauts），仅在直接解析失败时做一次清洗重试。
-"""
-
+import io
 import logging
-import os
 import re
 import zipfile
 import xml.etree.ElementTree as ET
@@ -15,7 +10,7 @@ from typing import Any, Dict, Generator, Optional
 
 logger = logging.getLogger(__name__)
 
-# 设备主表字段（与官方 XML 标签一致）
+# Device fields use the spelling from the official XML schema.
 DEVICE_FIELDS = [
     "zxxsdycpbs", "cpbsbmtxmc", "cpbsfbrq", "zxxsdyzsydydsl", "sydycpbs",
     "bszt", "sfyzcbayz", "zcbacpbs", "sfybtzjbs", "btcpbsyzxxsdycpbssfyz",
@@ -25,107 +20,289 @@ DEVICE_FIELDS = [
     "zdcfsycs", "sfwwjbz", "syqsfxyjxmj", "mjfs", "qtxxdwzlj", "tsrq",
     "scbssfbhph", "scbssfbhxlh", "scbssfbhscrq", "scbssfbhsxrq",
     "tscchcztj", "tsccsm", "deviceRecordKey", "versionNumber", "versionTime",
-    "versionStauts",  # 官方字段拼写如此，非笔误
-    "correctionNumber", "correctionRemark", "correctionTime",
+    "versionStauts", "correctionNumber", "correctionRemark", "correctionTime",
 ]
+DEVICE_FIELD_SET = set(DEVICE_FIELDS)
 
-# 嵌套列表：父标签 -> (子元素标签, 字段列表, 记录键, 是否有标记)
+# Parent tag -> (item tag, item fields, output key).
 NESTED_LISTS = {
-    "packingList": ("packing", ["bzcpbs", "cpbzjb", "bznhxyjcpbssl", "bznhxyjbzcpbs"], "packing_list", "has_packing_list"),
-    "storageList": ("storage", ["cchcztj", "zdz", "zgz", "jldw"], "storage_list", "has_storage_list"),
-    "clinicalList": ("clinical", ["lcsycclx", "ccz", "ccdw"], "clinical_list", "has_clinical_list"),
-    "contactList": ("contact", ["qylxrcz", "qylxryx", "qylxrdh"], "contact_list", None),
+    "packingList": ("packing", ["bzcpbs", "cpbzjb", "bznhxyjcpbssl", "bznhxyjbzcpbs"], "packing_list"),
+    "storageList": ("storage", ["cchcztj", "zdz", "zgz", "jldw"], "storage_list"),
+    "clinicalList": ("clinical", ["lcsycclx", "ccz", "ccdw"], "clinical_list"),
+    "contactList": ("contact", ["qylxrcz", "qylxryx", "qylxrdh"], "contact_list"),
 }
 
-INVALID_CHARS_RE = re.compile(r"&#(?:13|10|9);|[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]")
+HEADER_RECORD_COUNT_TAG = "numberRkeyecordXML"
+
+# XML 1.0 permits only tab, LF, and CR below U+0020. Keep U+007F-U+009F;
+# they are legal XML characters and removing them would alter source data.
+INVALID_XML10_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\uD800-\uDFFF\uFFFE\uFFFF]")
+BARE_AMPERSAND_RE = re.compile(
+    r"&(?!amp;|lt;|gt;|quot;|apos;|#(?:[0-9]+|[xX][0-9A-Fa-f]+);)"
+)
+NUMERIC_ENTITY_RE = re.compile(r"&#(?:[0-9]+|[xX][0-9A-Fa-f]+);")
+CDATA_RE = re.compile(r"(<!\[CDATA\[.*?\]\]>)", re.DOTALL)
+XML_DECLARATION_RE = re.compile(r"^\s*<\?xml[^>]*\?>", re.IGNORECASE)
+PART_NUMBER_RE = re.compile(r"PART(\d+)", re.IGNORECASE)
+
+
+class XMLParseError(ValueError):
+    """Raised when an XML member cannot be safely normalized or validated."""
+
+
+def _local_name(tag: Any) -> str:
+    """Return a tag name without an optional XML namespace."""
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _text_value(element: ET.Element) -> Optional[str]:
+    text = "".join(element.itertext()).strip()
+    return text or None
+
+
+def _children(element: ET.Element, name: str):
+    for child in element:
+        if _local_name(child.tag) == name:
+            yield child
+
+
+def _escape_bare_ampersands(content: str) -> str:
+    """Escape only ampersands that are not valid XML entity references."""
+    parts = CDATA_RE.split(content)
+    for index in range(0, len(parts), 2):
+        parts[index] = BARE_AMPERSAND_RE.sub("&amp;", parts[index])
+    return "".join(parts)
+
+
+def _is_valid_xml10_codepoint(value: int) -> bool:
+    return (
+        value in (0x9, 0xA, 0xD)
+        or 0x20 <= value <= 0xD7FF
+        or 0xE000 <= value <= 0xFFFD
+        or 0x10000 <= value <= 0x10FFFF
+    )
+
+
+def _remove_invalid_numeric_entities(content: str) -> str:
+    """Remove numeric references to characters XML 1.0 cannot represent."""
+    def replace(match: re.Match) -> str:
+        token = match.group(0)[2:-1]
+        base = 16 if token[:1].lower() == "x" else 10
+        digits = token[1:] if base == 16 else token
+        try:
+            value = int(digits, base)
+        except ValueError:
+            return ""
+        return match.group(0) if _is_valid_xml10_codepoint(value) else ""
+
+    return NUMERIC_ENTITY_RE.sub(replace, content)
 
 
 def _clean_xml(content: str) -> str:
-    """移除无效控制字符并修复裸 & 符号。"""
-    content = INVALID_CHARS_RE.sub("", content)
-    content = content.replace("&", "&amp;")
-    for name in ("amp", "lt", "gt", "quot", "apos"):
-        content = content.replace(f"&amp;{name};", f"&{name};")
-    return content
+    """Remove only XML 1.0-invalid code points and repair bare ampersands."""
+    content = INVALID_XML10_RE.sub("", content)
+    content = _remove_invalid_numeric_entities(content)
+    content = _escape_bare_ampersands(content)
+    # Parsing a Unicode string with an encoding declaration is interpreter
+    # dependent; the declaration carries no data needed by the extractor.
+    return XML_DECLARATION_RE.sub("", content, count=1)
 
 
-def _parse_root(content: str) -> Optional[ET.Element]:
+def _normalize_xml(content: str):
+    invalid_count = len(INVALID_XML10_RE.findall(content))
+    return _clean_xml(content), invalid_count
+
+
+def _read_normalized_xml(archive: zipfile.ZipFile, name: str, log_cleanup: bool) -> str:
     try:
-        return ET.fromstring(content)
-    except ET.ParseError:
-        logger.warning("XML 解析失败，尝试清洗后重试")
-        try:
-            return ET.fromstring(_clean_xml(content))
-        except ET.ParseError as e:
-            logger.error(f"清洗后仍解析失败: {e}")
-            return None
+        raw = archive.read(name)
+    except (KeyError, OSError, zipfile.BadZipFile) as error:
+        raise XMLParseError(f"读取 XML 失败 {name}: {error}") from error
+
+    try:
+        content = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise XMLParseError(f"{name}: 不是有效的 UTF-8 XML: {error}") from error
+    if content.startswith("\ufeff"):
+        content = content[1:]
+
+    normalized, invalid_count = _normalize_xml(content)
+    if log_cleanup and invalid_count:
+        logger.warning("%s: 已移除 %s 个 XML 1.0 非法字符", name, invalid_count)
+    return normalized
 
 
-def _records_from_root(root: ET.Element) -> Generator[Dict[str, Any], None, int]:
-    """从已构建的根节点逐条产出设备记录，返回记录数。"""
-    total = 0
-    for device in root.findall(".//device"):
-        record = _extract_device(device)
-        if record:
-            total += 1
-            yield record
-    return total
+def _validate_xml(content: str, name: str) -> int:
+    """Validate one XML member before any records are emitted."""
+    root_tag = None
+    declared_count = None
+    device_count = 0
+    current_device_key = None
+    in_device = False
+    seen_keys = set()
+    path = []
+
+    try:
+        context = ET.iterparse(io.StringIO(content), events=("start", "end"))
+        for event, element in context:
+            tag = _local_name(element.tag)
+            if event == "start":
+                path.append(tag)
+                if root_tag is None:
+                    root_tag = tag
+                if tag == "device":
+                    if len(path) < 2 or path[-2] != "devices":
+                        raise XMLParseError(f"{name}: device 不在 devices 节点下")
+                    if in_device:
+                        raise XMLParseError(f"{name}: 发现嵌套 device 记录")
+                    in_device = True
+                    current_device_key = None
+                continue
+
+            if tag == HEADER_RECORD_COUNT_TAG:
+                if len(path) < 2 or path[-2] != "header":
+                    raise XMLParseError(f"{name}: {HEADER_RECORD_COUNT_TAG} 不在 header 节点下")
+                value = _text_value(element)
+                if value is None:
+                    raise XMLParseError(f"{name}: {HEADER_RECORD_COUNT_TAG} 为空")
+                try:
+                    parsed_count = int(value)
+                except ValueError as error:
+                    raise XMLParseError(f"{name}: {HEADER_RECORD_COUNT_TAG} 不是整数: {value}") from error
+                if parsed_count < 0:
+                    raise XMLParseError(f"{name}: {HEADER_RECORD_COUNT_TAG} 不能为负数")
+                if declared_count is not None and declared_count != parsed_count:
+                    raise XMLParseError(f"{name}: {HEADER_RECORD_COUNT_TAG} 重复且数值不一致")
+                declared_count = parsed_count
+            elif tag == "deviceRecordKey" and in_device:
+                if len(path) < 2 or path[-2] != "device":
+                    raise XMLParseError(f"{name}: deviceRecordKey 不在 device 节点下")
+                current_device_key = (_text_value(element) or "").strip()
+            elif tag == "device":
+                if not in_device:
+                    raise XMLParseError(f"{name}: device 结构异常")
+                device_count += 1
+                if not current_device_key:
+                    raise XMLParseError(f"{name}: 存在缺少 deviceRecordKey 的设备记录")
+                if current_device_key in seen_keys:
+                    raise XMLParseError(f"{name}: deviceRecordKey 重复: {current_device_key}")
+                seen_keys.add(current_device_key)
+                in_device = False
+                current_device_key = None
+
+            # The validation pass does not need field contents. Clearing each
+            # completed element keeps memory bounded for large XML members.
+            element.clear()
+            path.pop()
+    except XMLParseError:
+        raise
+    except ET.ParseError as error:
+        raise XMLParseError(f"{name}: XML 解析失败: {error}") from error
+
+    if root_tag != "udid":
+        raise XMLParseError(f"{name}: 根节点不是 udid，而是 {root_tag!r}")
+    if declared_count is None:
+        raise XMLParseError(f"{name}: 缺少 {HEADER_RECORD_COUNT_TAG}")
+    if device_count != declared_count:
+        raise XMLParseError(
+            f"{name}: XML 声明 {declared_count} 条，实际解析到 {device_count} 条"
+        )
+    return declared_count
 
 
-def _field_text(elem: ET.Element, tag: str) -> Optional[str]:
-    child = elem.find(tag)
-    return child.text.strip() if child is not None and child.text else None
+def _field_text(element: ET.Element, tag: str) -> Optional[str]:
+    child = next(_children(element, tag), None)
+    return _text_value(child) if child is not None else None
 
 
 def _extract_device(device: ET.Element) -> Optional[Dict[str, Any]]:
-    record = {field: _field_text(device, field) for field in DEVICE_FIELDS}
+    record = {field: None for field in DEVICE_FIELDS}
+    for child in device:
+        field = _local_name(child.tag)
+        if field in DEVICE_FIELD_SET:
+            record[field] = _text_value(child)
 
-    for parent, (element, fields, record_key, flag) in NESTED_LISTS.items():
+    for parent_name, (item_name, fields, result_name) in NESTED_LISTS.items():
+        parent = next(_children(device, parent_name), None)
         items = []
-        list_elem = device.find(parent)
-        if list_elem is not None:
-            items = [
-                {field: _field_text(item, field) for field in fields}
-                for item in list_elem.findall(element)
-            ]
-        record[record_key] = items
-        if flag:
-            record[flag] = bool(items)
+        if parent is not None:
+            for item in _children(parent, item_name):
+                items.append({field: _field_text(item, field) for field in fields})
+        record[result_name] = items
 
-    if not record.get("deviceRecordKey"):
-        logger.debug("缺少 deviceRecordKey，跳过记录")
-        return None
-    return record
+    record["has_packing_list"] = bool(record["packing_list"])
+    record["has_storage_list"] = bool(record["storage_list"])
+    record["has_clinical_list"] = bool(record["clinical_list"])
+    return record if record.get("deviceRecordKey") else None
+
+
+def _extract_xml_records(content: str, name: str) -> Generator[Dict[str, Any], None, None]:
+    try:
+        for _, device in ET.iterparse(io.StringIO(content), events=("end",)):
+            if _local_name(device.tag) != "device":
+                continue
+            record = _extract_device(device)
+            device.clear()
+            if record is None:
+                raise XMLParseError(f"{name}: 设备记录缺少 deviceRecordKey")
+            yield record
+    except XMLParseError:
+        raise
+    except ET.ParseError as error:
+        raise XMLParseError(f"{name}: XML 提取失败: {error}") from error
+
+
+def _xml_sort_key(name: str):
+    match = PART_NUMBER_RE.search(name)
+    return (int(match.group(1)) if match else 0, name)
 
 
 def parse_zip_file(zip_path: str) -> Generator[Dict[str, Any], None, None]:
-    """解析 ZIP 中的所有 XML，逐条产出设备记录。"""
-    with zipfile.ZipFile(zip_path, "r") as zip_ref:
-        xml_files = [name for name in zip_ref.namelist() if name.endswith(".xml")]
-        logger.info(f"解析 {os.path.basename(zip_path)}，共 {len(xml_files)} 个 XML 文件")
+    """Validate every XML in a ZIP, then yield each device exactly once."""
+    try:
+        archive = zipfile.ZipFile(zip_path, "r")
+    except (OSError, zipfile.BadZipFile) as error:
+        raise XMLParseError(f"无法打开 ZIP: {zip_path}: {error}") from error
+
+    with archive:
+        names = sorted(
+            (name for name in archive.namelist() if name.lower().endswith(".xml")),
+            key=_xml_sort_key,
+        )
+        if not names:
+            raise XMLParseError("ZIP 中没有 XML 文件")
+        if len(names) != len(set(names)):
+            raise XMLParseError("ZIP 中存在重复的 XML 文件名")
+
+        logger.info("解析 %s，共 %s 个 XML 文件", zip_path, len(names))
+
+        # The complete validation pass prevents a malformed later XML from
+        # causing earlier records to be emitted and then emitted again on retry.
+        expected_counts = {}
+        expected_total = 0
+        for name in names:
+            content = _read_normalized_xml(archive, name, log_cleanup=True)
+            declared_count = _validate_xml(content, name)
+            expected_counts[name] = declared_count
+            expected_total += declared_count
+
+        logger.info("XML 完整性校验通过，确认 %s 条记录", expected_total)
 
         total = 0
-        for xml_file in xml_files:
-            try:
-                with zip_ref.open(xml_file) as f:
-                    # 流式解析：每处理完一条记录立即释放，控制内存峰值
-                    for _, device in ET.iterparse(f, events=("end",)):
-                        if device.tag != "device":
-                            continue
-                        record = _extract_device(device)
-                        device.clear()
-                        if record:
-                            total += 1
-                            yield record
-            except ET.ParseError:
-                # 流式解析失败时回退：整文件读取并清洗后重试
-                logger.warning(f"流式解析失败，回退整文件清洗: {xml_file}")
-                with zip_ref.open(xml_file) as f:
-                    root = _parse_root(f.read().decode("utf-8", errors="replace"))
-                if root is not None:
-                    for record in _records_from_root(root):
-                        total += 1
-                        yield record
-            except Exception as e:
-                logger.error(f"处理 XML 失败 {xml_file}: {e}")
-        logger.info(f"解析完成，共 {total} 条记录")
+        for name in names:
+            content = _read_normalized_xml(archive, name, log_cleanup=False)
+            extracted_count = 0
+            for record in _extract_xml_records(content, name):
+                extracted_count += 1
+                total += 1
+                yield record
+            if extracted_count != expected_counts[name]:
+                raise XMLParseError(
+                    f"{name}: 校验阶段声明 {expected_counts[name]} 条，提取阶段得到 {extracted_count} 条"
+                )
+
+        if total != expected_total:
+            raise XMLParseError(f"ZIP 记录数异常：校验 {expected_total} 条，提取 {total} 条")
+        logger.info("解析完成，共 %s 条记录", total)

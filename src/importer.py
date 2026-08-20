@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""
-MySQL 导入模块
-
-策略：
-- 设备主表按批次 UPSERT（有则更新，无则插入）
-- 明细表（包装/储存/临床/联系人）按批次先删旧数据，再批量插入
-"""
+"""Import parsed UDI records into MySQL."""
 
 import logging
+import re
 import time
 from datetime import datetime
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import mysql.connector
 
@@ -18,7 +13,12 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 1000
 
-# (XML 标签, 数据库列名)
+# These errors identify a value that cannot fit or be converted for one row.
+# Connection, server, and SQL-programming errors must still fail the file.
+ROW_DATA_ERROR_CODES = frozenset({1048, 1264, 1292, 1366, 1406, 1411, 1525, 3819})
+COLUMN_ERROR_RE = re.compile(r"column\s+['`\"]([^'`\"]+)['`\"]", re.IGNORECASE)
+
+# (XML tag, database column)
 DEVICE_FIELDS = [
     ("deviceRecordKey", "device_record_key"),
     ("zxxsdycpbs", "zxxsdycpbs"),
@@ -72,7 +72,6 @@ DEVICE_FIELDS = [
 DATE_FIELDS = {"cpbsfbrq", "tsrq", "version_time", "correction_time"}
 INT_FIELDS = {"zxxsdyzsydydsl", "version_number", "correction_number"}
 FLAG_COLUMNS = ["has_packing_list", "has_storage_list", "has_clinical_list"]
-
 DETAIL_TABLES = ("udi_packing_list", "udi_storage_list", "udi_clinical_list", "udi_contacts")
 
 INSERT_DETAIL_SQL = {
@@ -94,16 +93,16 @@ INSERT_DETAIL_SQL = {
     ),
 }
 
-_device_columns = [col for _, col in DEVICE_FIELDS] + FLAG_COLUMNS
+_device_columns = [column for _, column in DEVICE_FIELDS] + FLAG_COLUMNS
 INSERT_DEVICE_SQL = (
     "INSERT INTO udi_devices (" + ", ".join(_device_columns) + ") VALUES ("
     + ", ".join(["%s"] * len(_device_columns)) + ") ON DUPLICATE KEY UPDATE "
-    + ", ".join(f"{col} = VALUES({col})" for col in _device_columns if col != "device_record_key")
+    + ", ".join(f"{column} = VALUES({column})" for column in _device_columns if column != "device_record_key")
 )
 
 
 def _clean(value: Any) -> Optional[str]:
-    """空值统一转 None，避免空字符串触发 MySQL 严格模式报错。"""
+    """Convert empty values to NULL without truncating source text."""
     if value is None:
         return None
     text = str(value).strip()
@@ -114,13 +113,12 @@ def _parse_date(value: Any) -> Optional[str]:
     text = _clean(value)
     if text is None:
         return None
-    # correctionTime 官方数据可能带时间戳，统一只取日期部分
     for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
         try:
             return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
-    logger.warning(f"无法解析日期，置空: {text}")
+    logger.warning("无法解析日期，置空: %s", text)
     return None
 
 
@@ -131,7 +129,7 @@ def _parse_int(value: Any) -> Optional[int]:
     try:
         return int(text)
     except ValueError:
-        logger.warning(f"无法解析整数，置空: {text}")
+        logger.warning("无法解析整数，置空: %s", text)
         return None
 
 
@@ -153,28 +151,29 @@ def _detail_rows(record: Dict[str, Any]) -> Dict[str, List[Tuple[Any, ...]]]:
     key = record.get("deviceRecordKey")
     return {
         "udi_packing_list": [
-            (key, _clean(p.get("bzcpbs")), _clean(p.get("cpbzjb")),
-             _parse_int(p.get("bznhxyjcpbssl")), _clean(p.get("bznhxyjbzcpbs")))
-            for p in record.get("packing_list", [])
+            (key, _clean(item.get("bzcpbs")), _clean(item.get("cpbzjb")),
+             _parse_int(item.get("bznhxyjcpbssl")), _clean(item.get("bznhxyjbzcpbs")))
+            for item in record.get("packing_list", [])
         ],
         "udi_storage_list": [
-            (key, _clean(s.get("cchcztj")), _clean(s.get("zdz")), _clean(s.get("zgz")), _clean(s.get("jldw")))
-            for s in record.get("storage_list", [])
+            (key, _clean(item.get("cchcztj")), _clean(item.get("zdz")),
+             _clean(item.get("zgz")), _clean(item.get("jldw")))
+            for item in record.get("storage_list", [])
         ],
         "udi_clinical_list": [
-            (key, _clean(c.get("lcsycclx")), _clean(c.get("ccz")), _clean(c.get("ccdw")))
-            for c in record.get("clinical_list", [])
+            (key, _clean(item.get("lcsycclx")), _clean(item.get("ccz")), _clean(item.get("ccdw")))
+            for item in record.get("clinical_list", [])
         ],
         "udi_contacts": [
-            (key, _clean(c.get("qylxrcz")), _clean(c.get("qylxryx")), _clean(c.get("qylxrdh")))
-            for c in record.get("contact_list", [])
+            (key, _clean(item.get("qylxrcz")), _clean(item.get("qylxryx")), _clean(item.get("qylxrdh")))
+            for item in record.get("contact_list", [])
         ],
     }
 
 
 def _import_batch(conn, records: List[Dict[str, Any]]) -> None:
-    """导入一批记录：UPSERT 设备 + 删除旧明细 + 插入新明细。"""
-    device_rows = [_device_row(r) for r in records]
+    """Import one transaction: device UPSERT and replacement detail rows."""
+    device_rows = [_device_row(record) for record in records]
     keys = [row[0] for row in device_rows]
     placeholders = ", ".join(["%s"] * len(keys))
 
@@ -183,25 +182,71 @@ def _import_batch(conn, records: List[Dict[str, Any]]) -> None:
         cursor.executemany(INSERT_DEVICE_SQL, device_rows)
         for table in DETAIL_TABLES:
             cursor.execute(f"DELETE FROM {table} WHERE device_record_key IN ({placeholders})", keys)
-        details = [_detail_rows(r) for r in records]
+        details = [_detail_rows(record) for record in records]
         for table in DETAIL_TABLES:
-            rows = [row for d in details for row in d[table]]
+            rows = [row for detail in details for row in detail[table]]
             if rows:
                 cursor.executemany(INSERT_DETAIL_SQL[table], rows)
     finally:
         cursor.close()
 
 
-def _flush(conn, batch: List[Dict[str, Any]]) -> int:
-    """导入一批并提交，失败则回滚；返回失败条数。"""
+def _error_code(error: Exception) -> Optional[int]:
+    code = getattr(error, "errno", None)
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_row_data_error(error: Exception) -> bool:
+    return _error_code(error) in ROW_DATA_ERROR_CODES
+
+
+def _affected_column(error: Exception) -> Optional[str]:
+    match = COLUMN_ERROR_RE.search(str(error))
+    return match.group(1) if match else None
+
+
+def _record_failure(record: Dict[str, Any], error: Exception) -> Dict[str, Any]:
+    return {
+        "device_record_key": _clean(record.get("deviceRecordKey")),
+        "error_code": _error_code(error),
+        "affected_column": _affected_column(error),
+        "error_message": str(error),
+    }
+
+
+def _flush(
+    conn,
+    batch: List[Dict[str, Any]],
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """Commit valid rows and recursively isolate row-level data errors."""
     try:
         _import_batch(conn, batch)
         conn.commit()
-        return 0
-    except Exception as e:
+        return len(batch), []
+    except Exception as error:
         conn.rollback()
-        logger.error(f"批次导入失败（{len(batch)} 条）: {e}")
-        return len(batch)
+        if not _is_row_data_error(error):
+            raise
+
+        if len(batch) == 1:
+            failure = _record_failure(batch[0], error)
+            logger.error(
+                "单条记录导入失败: deviceRecordKey=%s column=%s code=%s error=%s",
+                failure["device_record_key"],
+                failure["affected_column"],
+                failure["error_code"],
+                failure["error_message"],
+            )
+            return 0, [failure]
+
+        midpoint = len(batch) // 2
+        logger.warning("批次包含数据错误，拆分定位：%s 条", len(batch))
+        left_success, left_failures = _flush(conn, batch[:midpoint])
+        right_success, right_failures = _flush(conn, batch[midpoint:])
+        return left_success + right_success, left_failures + right_failures
 
 
 def _connect(config):
@@ -215,13 +260,54 @@ def _connect(config):
             autocommit=False,
             connection_timeout=30,
         )
-    except mysql.connector.Error as e:
-        logger.error(f"数据库连接失败: {e}")
+    except mysql.connector.Error as error:
+        logger.error("数据库连接失败: %s", error)
         return None
 
 
-def _log_import(conn, file_name: str, total: int, success: int, failed: int,
-                status: str, error: Optional[str], duration: float) -> None:
+def _log_record_errors(conn, file_name: str, failures: List[Dict[str, Any]]) -> bool:
+    if not failures:
+        return True
+    cursor = None
+    try:
+        cursor = conn.cursor()
+        cursor.executemany(
+            "INSERT INTO import_error_records "
+            "(file_name, device_record_key, error_code, affected_column, error_message) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            [
+                (
+                    file_name,
+                    failure["device_record_key"],
+                    failure["error_code"],
+                    failure["affected_column"],
+                    failure["error_message"],
+                )
+                for failure in failures
+            ],
+        )
+        conn.commit()
+        return True
+    except Exception as error:
+        conn.rollback()
+        logger.warning("记录逐条导入错误失败: %s", error)
+        return False
+    finally:
+        if cursor is not None:
+            cursor.close()
+
+
+def _log_import(
+    conn,
+    file_name: str,
+    total: int,
+    success: int,
+    failed: int,
+    status: str,
+    error: Optional[str],
+    duration: float,
+) -> None:
+    cursor = None
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -230,13 +316,15 @@ def _log_import(conn, file_name: str, total: int, success: int, failed: int,
             (file_name, total, success, failed, status, error, int(duration)),
         )
         conn.commit()
-        cursor.close()
-    except Exception as e:
-        logger.warning(f"记录导入日志失败: {e}")
+    except Exception as exc:
+        logger.warning("记录导入日志失败: %s", exc)
+    finally:
+        if cursor is not None:
+            cursor.close()
 
 
-def import_records(config, file_name: str, record_generator: Generator) -> Dict[str, Any]:
-    """从解析生成器导入数据，返回汇总结果。"""
+def import_records(config, file_name: str, record_generator: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """Import records and return a file-level result for inbox cleanup."""
     conn = _connect(config)
     if conn is None:
         return {"status": "failed", "error": "数据库连接失败"}
@@ -244,26 +332,50 @@ def import_records(config, file_name: str, record_generator: Generator) -> Dict[
     start = time.time()
     total = success = failed = 0
     batch: List[Dict[str, Any]] = []
+    row_failures: List[Dict[str, Any]] = []
 
     try:
         for record in record_generator:
             total += 1
             batch.append(record)
             if len(batch) >= BATCH_SIZE:
-                batch_failed = _flush(conn, batch)
-                failed += batch_failed
-                success += len(batch) - batch_failed
+                committed, failures = _flush(conn, batch)
+                success += committed
+                row_failures.extend(failures)
+                failed += len(failures)
                 batch = []
 
         if batch:
-            batch_failed = _flush(conn, batch)
-            failed += batch_failed
-            success += len(batch) - batch_failed
+            committed, failures = _flush(conn, batch)
+            success += committed
+            row_failures.extend(failures)
+            failed += len(failures)
 
         duration = time.time() - start
-        status = "completed" if total > 0 and failed == 0 else "failed"
-        _log_import(conn, file_name, total, success, failed, status, None, duration)
-        logger.info(f"导入完成: {file_name} 共{total}条 成功{success} 失败{failed} 耗时{duration:.1f}s")
+        error_log_ok = _log_record_errors(conn, file_name, row_failures)
+        if total == 0:
+            status = "failed"
+            error = "未解析到任何记录"
+        elif row_failures and not error_log_ok:
+            status = "failed"
+            error = "部分记录导入失败且无法写入异常记录表"
+        elif row_failures:
+            status = "completed_with_errors"
+            error = f"{failed} 条记录未导入，详见 import_error_records"
+        else:
+            status = "completed"
+            error = None
+
+        _log_import(conn, file_name, total, success, failed, status, error, duration)
+        logger.info(
+            "导入完成: %s 共%s条 成功%s 失败%s 状态%s 耗时%.1fs",
+            file_name,
+            total,
+            success,
+            failed,
+            status,
+            duration,
+        )
         return {
             "status": status,
             "total_records": total,
@@ -272,14 +384,15 @@ def import_records(config, file_name: str, record_generator: Generator) -> Dict[
             "duration_seconds": round(duration, 2),
         }
 
-    except Exception as e:
+    except Exception as error:
         conn.rollback()
         duration = time.time() - start
-        logger.error(f"导入异常: {e}")
-        _log_import(conn, file_name, total, success, failed, "failed", str(e), duration)
+        logger.error("导入异常: %s", error)
+        _log_record_errors(conn, file_name, row_failures)
+        _log_import(conn, file_name, total, success, failed, "failed", str(error), duration)
         return {
             "status": "failed",
-            "error": str(e),
+            "error": str(error),
             "total_records": total,
             "success_records": success,
             "failed_records": failed,
